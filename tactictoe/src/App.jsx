@@ -7,6 +7,12 @@ import { useState, useEffect, useCallback, useRef } from "react";
 const SUPABASE_URL  = "https://ifqbmteotnxrlilagygv.supabase.co";   // e.g. https://xyzxyz.supabase.co
 const SUPABASE_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlmcWJtdGVvdG54cmxpbGFneWd2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk3OTMyNzAsImV4cCI6MjA5NTM2OTI3MH0.sKufzYKKKYPNl6bp6dbRswqt3-efHtKVZ8UaYwBcEEU";
 
+/* ⚙️  CLOUDFLARE TURNSTILE  — replace with your site key
+   Get it from: dash.cloudflare.com → Turnstile → Add site
+   Leave as-is to disable CAPTCHA (not recommended for public release) */
+const TURNSTILE_SITE_KEY = "0x4AAAAAADW1Vh4qyCaueYhh";
+function turnstileEnabled() { return TURNSTILE_SITE_KEY !== "YOUR_TURNSTILE_SITE_KEY"; }
+
 /* ═══════════════════════════════════════════════════════════════════
    SUPABASE CLIENT  (no SDK needed — plain fetch)
 ═══════════════════════════════════════════════════════════════════ */
@@ -61,6 +67,8 @@ const supa = {
   },
 
   // ── Realtime shared state (game rooms, quickplay) via kv table ──
+  // Reads are public (needed for room code join by guests).
+  // Writes require a valid session token.
   async kvGet(key) {
     const r = await fetch(`${SUPABASE_URL}/rest/v1/kv?key=eq.${encodeURIComponent(key)}&select=value`, {
       headers: this._h(null),
@@ -69,21 +77,25 @@ const supa = {
     if (!Array.isArray(d)||d.length===0) return null;
     try { return JSON.parse(d[0].value); } catch { return d[0].value; }
   },
-  async kvSet(key, value) {
+  async kvSet(key, value, token) {
+    // Reject oversized payloads (>32KB) to prevent abuse
+    const serialized = JSON.stringify(value);
+    if (serialized.length > 32768) { console.warn("kvSet: payload too large, rejected"); return false; }
     const r = await fetch(`${SUPABASE_URL}/rest/v1/kv`, {
       method:"POST",
-      headers:{ ...this._h(null), Prefer:"resolution=merge-duplicates,return=representation" },
-      body: JSON.stringify({ key, value: JSON.stringify(value), updated_at: new Date().toISOString() }),
+      headers:{ ...this._h(token||null), Prefer:"resolution=merge-duplicates,return=representation" },
+      body: JSON.stringify({ key, value: serialized, updated_at: new Date().toISOString() }),
     });
     return r.ok;
   },
-  async kvDel(key) {
+  async kvDel(key, token) {
     await fetch(`${SUPABASE_URL}/rest/v1/kv?key=eq.${encodeURIComponent(key)}`, {
-      method:"DELETE", headers: this._h(null),
+      method:"DELETE", headers: this._h(token||null),
     });
   },
   async kvList(prefix) {
-    const r = await fetch(`${SUPABASE_URL}/rest/v1/kv?key=like.${encodeURIComponent(prefix+'%')}&select=key,value`, {
+    // List is read-only, no token needed
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/kv?key=like.${encodeURIComponent(prefix+'%')}&select=key,value&limit=50`, {
       headers: this._h(null),
     });
     const d = await r.json();
@@ -105,6 +117,55 @@ function clearSession() { try { localStorage.removeItem(SESSION_KEY); } catch(_)
 ═══════════════════════════════════════════════════════════════════ */
 function isConfigured() {
   return SUPABASE_URL !== "YOUR_SUPABASE_URL" && SUPABASE_ANON !== "YOUR_SUPABASE_ANON_KEY";
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   TURNSTILE CAPTCHA  (Cloudflare — invisible/managed widget)
+═══════════════════════════════════════════════════════════════════ */
+
+// Loads Cloudflare Turnstile script once
+function useTurnstileScript() {
+  useEffect(() => {
+    if (!turnstileEnabled()) return;
+    if (document.getElementById("cf-turnstile-script")) return;
+    const s = document.createElement("script");
+    s.id = "cf-turnstile-script";
+    s.src = "https://challenges.cloudflare.com/turnstile/v0/api.js";
+    s.async = true; s.defer = true;
+    document.head.appendChild(s);
+  }, []);
+}
+
+// Turnstile widget component — renders the challenge and calls onVerify(token)
+function TurnstileWidget({ onVerify, onError }) {
+  const ref = useRef(null);
+  const widgetId = useRef(null);
+
+  useEffect(() => {
+    if (!turnstileEnabled() || !ref.current) return;
+    function tryRender() {
+      if (window.turnstile) {
+        widgetId.current = window.turnstile.render(ref.current, {
+          sitekey: TURNSTILE_SITE_KEY,
+          callback: onVerify,
+          "error-callback": onError || (() => {}),
+          theme: "dark",
+          size: "normal",
+        });
+      } else {
+        setTimeout(tryRender, 200);
+      }
+    }
+    tryRender();
+    return () => {
+      if (widgetId.current && window.turnstile) {
+        try { window.turnstile.remove(widgetId.current); } catch(_) {}
+      }
+    };
+  }, [onVerify, onError]);
+
+  if (!turnstileEnabled()) return null;
+  return <div ref={ref} style={{ margin: "12px auto 0", display:"flex", justifyContent:"center" }}/>;
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -357,29 +418,38 @@ function scoreMove2Ply(game, majIdx, minIdx) {
 }
 
 // ── Difficulty profiles ──────────────────────────────────────────
-// Each difficulty defines how often to pick from the ranked move list.
-// The AI ALWAYS scores all moves via 2-ply — difficulty only controls
-// which rank it selects from, so lower difficulties "play dumb" not "play blind".
-//
-// Tiers are defined as an array of [maxRankIndex, probability] pairs.
-// maxRankIndex: pick randomly from moves ranked 0..maxRankIndex
-// Immediate wins/blocks are always taken regardless of difficulty.
+// Each tier picks from moves ranked 0..maxRank (0 = best).
+// Weights are relative — they don't need to sum to 100.
+// All difficulties see the full 2-ply evaluation; difficulty controls
+// how reliably the AI acts on that knowledge.
+// Immediate wins and forced blocks always override difficulty.
 
 const AI_DIFFICULTIES = {
   easy: [
-    { maxRank: 4, weight: 70 },  // pick from top-5 moves,  70% of the time
-    { maxRank: 2, weight: 25 },  // pick from top-3 moves,  25% of the time
-    { maxRank: 0, weight:  5 },  // pick best move,          5% of the time
+    { maxRank: 6, weight: 30 }, // sometimes very bad
+    { maxRank: 5, weight: 20 }, // often bad
+    { maxRank: 4, weight: 18 }, // occasionally mediocre
+    { maxRank: 3, weight: 14 }, // sometimes mediocre
+    { maxRank: 2, weight: 10 }, // rarely decent
+    { maxRank: 1, weight:  5 }, // very rarely good
+    { maxRank: 0, weight:  3 }, // almost never best
   ],
   medium: [
-    { maxRank: 4, weight: 35 },
-    { maxRank: 2, weight: 50 },
-    { maxRank: 0, weight: 15 },
+    { maxRank: 6, weight:  5 }, // rare blunder
+    { maxRank: 5, weight:  8 }, // occasional poor move
+    { maxRank: 4, weight: 14 }, // sometimes suboptimal
+    { maxRank: 3, weight: 18 }, // decent chunk of 4th-best
+    { maxRank: 2, weight: 22 }, // often plays 2nd or 3rd best
+    { maxRank: 1, weight: 20 }, // frequently plays 2nd best
+    { maxRank: 0, weight: 13 }, // plays best move a fair amount
   ],
   hard: [
-    { maxRank: 4, weight: 15 },
-    { maxRank: 2, weight: 50 },
-    { maxRank: 0, weight: 35 },
+    { maxRank: 5, weight:  2 }, // very rare mistake
+    { maxRank: 4, weight:  4 }, // rare suboptimal
+    { maxRank: 3, weight:  7 }, // occasional 4th best
+    { maxRank: 2, weight: 14 }, // sometimes 3rd best
+    { maxRank: 1, weight: 28 }, // often 2nd best
+    { maxRank: 0, weight: 45 }, // usually best move
   ],
 };
 
@@ -462,6 +532,7 @@ function applyEloChanges(myUser, oppUser, myResult) {
 /* ═══════════════════════════════════════════════════════════════════
    KV HELPERS  (game rooms + quickplay via Supabase kv table)
    Falls back to window.storage when not configured (dev mode)
+   Writes require a session token — reads are public.
 ═══════════════════════════════════════════════════════════════════ */
 async function kvGet(key) {
   if (!isConfigured()) {
@@ -469,17 +540,17 @@ async function kvGet(key) {
   }
   return supa.kvGet(key);
 }
-async function kvSet(key, val) {
+async function kvSet(key, val, token) {
   if (!isConfigured()) {
     try { await window.storage.set(key,JSON.stringify(val),true); } catch{}; return;
   }
-  return supa.kvSet(key, val);
+  return supa.kvSet(key, val, token);
 }
-async function kvDel(key) {
+async function kvDel(key, token) {
   if (!isConfigured()) {
     try { await window.storage.delete(key,true); } catch{}; return;
   }
-  return supa.kvDel(key);
+  return supa.kvDel(key, token);
 }
 async function kvList(prefix) {
   if (!isConfigured()) {
@@ -488,12 +559,21 @@ async function kvList(prefix) {
   return supa.kvList(prefix);
 }
 
-async function saveRoom(rid,data){ await kvSet(`ttt:r:${rid}`,data); }
-async function loadRoom(rid){ return await kvGet(`ttt:r:${rid}`); }
-async function listRoomKeys(){
+// Room helpers — token required for writes
+async function saveRoom(rid, data, token) { await kvSet(`ttt:r:${rid}`, data, token); }
+async function loadRoom(rid) { return await kvGet(`ttt:r:${rid}`); }
+async function listRoomKeys() {
   const rows = await kvList("ttt:r:");
   return rows.map(r=>r.key);
 }
+
+// Validate a room key belongs to expected namespace (prevent injection)
+function isValidRoomId(rid) { return /^[A-Z0-9]{4,8}$/.test(rid); }
+// Validate a kv key is in an allowed namespace
+function isValidKvKey(key) {
+  return key.startsWith("ttt:r:") || key.startsWith("ttt:qp:");
+}
+
 function genId(n=5){ return Math.random().toString(36).slice(2,2+n).toUpperCase(); }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -537,9 +617,9 @@ create table profiles (
   created_at timestamptz default now()
 );
 alter table profiles enable row level security;
-create policy "Anyone can read profiles"   on profiles for select using (true);
-create policy "Anyone can insert profiles" on profiles for insert with check (true);
-create policy "Users can update own profile" on profiles for update using (auth.uid() = id);
+create policy "Anyone can read profiles"      on profiles for select using (true);
+create policy "Users can insert own profile"  on profiles for insert with check (auth.uid() = id);
+create policy "Users can update own profile"  on profiles for update using (auth.uid() = id);
 
 -- 2. KV table (game rooms, quickplay queue — public read/write is fine,
 --    game logic enforces correctness)
@@ -549,10 +629,10 @@ create table kv (
   updated_at timestamptz default now()
 );
 alter table kv enable row level security;
-create policy "Public read"  on kv for select using (true);
-create policy "Public write" on kv for insert with check (true);
-create policy "Public update" on kv for update using (true);
-create policy "Public delete" on kv for delete using (true);`;
+create policy "Public read"       on kv for select using (true);
+create policy "Auth write"       on kv for insert with check (auth.role() = 'authenticated');
+create policy "Auth update"      on kv for update using (auth.role() = 'authenticated');
+create policy "Auth delete"      on kv for delete using (auth.role() = 'authenticated');`;
 
   return (
     <div style={{maxWidth:560,margin:"0 auto",padding:"clamp(20px,4vw,40px)",animation:"fadeIn 0.4s ease"}}>
@@ -877,7 +957,7 @@ function GameOver({game,mySymbol,mode,onRematch,onHome,eloChange}) {
 /* ═══════════════════════════════════════════════════════════════════
    GAME SCREEN
 ═══════════════════════════════════════════════════════════════════ */
-function GameScreen({mode,roomId,profile,updateProfile,onHome,difficulty="hard"}) {
+function GameScreen({mode,roomId,profile,session,updateProfile,onHome,difficulty="hard"}) {
   const [game,setGame]=useState(initGame());
   const [myOnlineSym,setMyOnlineSym]=useState(null);
   const [roomData,setRoomData]=useState(null);
@@ -906,7 +986,7 @@ function GameScreen({mode,roomId,profile,updateProfile,onHome,difficulty="hard"}
       if(data.players.length>=2) return;
       const sym=O;
       data.players.push({id:myId,symbol:sym,username:profile?.username||null,elo:profile?.elo||null,profileId:profile?.id||null});
-      await saveRoom(roomId,data);
+      await saveRoom(roomId,data,session?.access_token);
     }
     const me=data.players.find(p=>p.id===myId);
     if(me) setMyOnlineSym(me.symbol);
@@ -1021,17 +1101,17 @@ function GameScreen({mode,roomId,profile,updateProfile,onHome,difficulty="hard"}
     if(!isMyTurn||game.phase!=="pick_major") return;
     const ng={...game,activeMajor:majIdx,phase:"pick_minor"};
     setGame(ng);
-    if(mode==="online"&&roomData){await saveRoom(roomId,{...roomData,game:ng});}
+    if(mode==="online"&&roomData){await saveRoom(roomId,{...roomData,game:ng},session?.access_token);}
   }
   async function handleMove(majorIdx,minorIdx){
     if(!isMyTurn||aiThinking) return;
     const ng=applyMove(game,majorIdx,minorIdx);
     setGame(ng);
-    if(mode==="online"&&roomData){const nd={...roomData,game:ng};await saveRoom(roomId,nd);setRoomData(nd);}
+    if(mode==="online"&&roomData){const nd={...roomData,game:ng};await saveRoom(roomId,nd,session?.access_token);setRoomData(nd);}
   }
   function handleRematch(){
     const ng=initGame(); setGame(ng); eloApplied.current=false; setEloChange(null); gameEndHandled.current=false;
-    if(mode==="online"&&roomData) saveRoom(roomId,{...roomData,game:ng});
+    if(mode==="online"&&roomData) saveRoom(roomId,{...roomData,game:ng},session?.access_token);
   }
 
   const diffLabel=difficulty==="easy"?"Easy":difficulty==="medium"?"Medium":"Hard";
@@ -1076,7 +1156,7 @@ function GameScreen({mode,roomId,profile,updateProfile,onHome,difficulty="hard"}
 const QP_PREFIX="ttt:qp:";
 const QP_ELO_WINDOW=100, QP_RELAX_MS=5000, QP_TIMEOUT_MS=30000;
 
-function QuickPlay({profile,onJoin}) {
+function QuickPlay({profile,session,onJoin}) {
   const [phase,setPhase]=useState("idle");
   const [elapsed,setElapsed]=useState(0);
   const [matchInfo,setMatchInfo]=useState(null);
@@ -1086,11 +1166,11 @@ function QuickPlay({profile,onJoin}) {
   async function startSearch(){
     setPhase("searching");setElapsed(0);setMatchInfo(null);
     startRef.current=Date.now();
-    await kvSet(`${QP_PREFIX}${profile.id}`,{id:profile.id,username:profile.username,elo:profile.elo||STARTING_ELO,status:"waiting",ts:Date.now()});
+    await kvSet(`${QP_PREFIX}${profile.id}`,{id:profile.id,username:profile.username,elo:profile.elo||STARTING_ELO,status:"waiting",ts:Date.now()},session?.access_token);
     timerRef.current=setInterval(()=>setElapsed(Math.floor((Date.now()-startRef.current)/1000)),500);
     pollRef.current=setInterval(async()=>{
       const timeIn=Date.now()-startRef.current;
-      if(timeIn>QP_TIMEOUT_MS){clearInterval(timerRef.current);clearInterval(pollRef.current);await kvDel(`${QP_PREFIX}${profile.id}`);setPhase("timeout");return;}
+      if(timeIn>QP_TIMEOUT_MS){clearInterval(timerRef.current);clearInterval(pollRef.current);await kvDel(`${QP_PREFIX}${profile.id}`,session?.access_token);setPhase("timeout");return;}
       const myEntry=await kvGet(`${QP_PREFIX}${profile.id}`);
       if(!myEntry) return;
       if(myEntry.status==="matched"&&myEntry.roomId){clearInterval(timerRef.current);clearInterval(pollRef.current);setPhase("matched");setTimeout(()=>onJoin(myEntry.roomId),800);return;}
@@ -1103,18 +1183,18 @@ function QuickPlay({profile,onJoin}) {
       if(!candidates.length) return;
       const opp=candidates.reduce((b,e)=>Math.abs(e.elo-myElo)<Math.abs(b.elo-myElo)?e:b,candidates[0]);
       const rid=genId(5);
-      await saveRoom(rid,{id:rid,players:[{id:profile.id,symbol:X,username:profile.username,elo:profile.elo||STARTING_ELO,profileId:profile.id}],game:initGame(),createdAt:Date.now(),quickPlay:true});
-      await kvSet(`${QP_PREFIX}${profile.id}`,{...myEntry,status:"matched",roomId:rid});
+      await saveRoom(rid,{id:rid,players:[{id:profile.id,symbol:X,username:profile.username,elo:profile.elo||STARTING_ELO,profileId:profile.id}],game:initGame(),createdAt:Date.now(),quickPlay:true},session?.access_token);
+      await kvSet(`${QP_PREFIX}${profile.id}`,{...myEntry,status:"matched",roomId:rid},session?.access_token);
       const oppEntry=await kvGet(`${QP_PREFIX}${opp.id}`);
       if(oppEntry&&oppEntry.status==="waiting"){
-        await kvSet(`${QP_PREFIX}${opp.id}`,{...oppEntry,status:"matched",roomId:rid});
+        await kvSet(`${QP_PREFIX}${opp.id}`,{...oppEntry,status:"matched",roomId:rid},session?.access_token);
         clearInterval(timerRef.current);clearInterval(pollRef.current);
         setMatchInfo({oppName:opp.username,oppElo:opp.elo});setPhase("matched");
         setTimeout(()=>onJoin(rid),800);
       }
     },1200);
   }
-  async function cancelSearch(){clearInterval(timerRef.current);clearInterval(pollRef.current);await kvDel(`${QP_PREFIX}${profile.id}`);setPhase("idle");setElapsed(0);}
+  async function cancelSearch(){clearInterval(timerRef.current);clearInterval(pollRef.current);await kvDel(`${QP_PREFIX}${profile.id}`,session?.access_token);setPhase("idle");setElapsed(0);}
   const dots=".".repeat((elapsed%3)+1).padEnd(3,"\u00a0");
   return (
     <div style={{textAlign:"center",padding:"24px 0"}}>
@@ -1157,57 +1237,183 @@ function QuickPlay({profile,onJoin}) {
 /* ═══════════════════════════════════════════════════════════════════
    ONLINE LOBBY
 ═══════════════════════════════════════════════════════════════════ */
-function OnlineLobby({profile,onJoin,onBack}) {
+function OnlineLobby({profile,session,onJoin,onBack}) {
   const [tab,setTab]=useState(profile?"quick":"room");
   const [code,setCode]=useState("");
   const [rooms,setRooms]=useState([]);
+  const [creating,setCreating]=useState(false);  // show create modal
+  const [isPublic,setIsPublic]=useState(true);    // public/private toggle
+  const [createErr,setCreateErr]=useState("");
+
+  // Fetch open public rooms
   useEffect(()=>{
-    async function fetch(){
+    async function fetchRooms(){
       const rows=await kvList("ttt:r:");
       const loaded=[];
-      for(const row of rows.slice(0,12)){
+      for(const row of rows.slice(0,20)){
         try{
           const d=typeof row.value==="string"?JSON.parse(row.value):row.value;
-          if(!d.game?.winner&&!d.game?.isDraw&&d.players?.length<2&&!d.quickPlay)
-            loaded.push({id:row.key.replace("ttt:r:","")});
+          if(!d.game?.winner&&!d.game?.isDraw&&d.players?.length<2&&!d.quickPlay&&d.isPublic)
+            loaded.push({
+              id:row.key.replace("ttt:r:",""),
+              host:d.players?.[0]?.username||"Guest",
+              elo:d.players?.[0]?.elo||null,
+            });
         }catch{}
       }
       setRooms(loaded);
     }
-    fetch();const t=setInterval(fetch,3000);return()=>clearInterval(t);
+    fetchRooms();
+    const t=setInterval(fetchRooms,3000);
+    return()=>clearInterval(t);
   },[]);
+
   async function create(){
+    setCreateErr("");
+    if(!profile||!session?.access_token){setCreateErr("Please sign in to create a room.");return;}
+    // Room cap check
+    const cap=3;
+    const allRooms=await kvList("ttt:r:");
+    let activeOwned=0;
+    for(const row of allRooms){
+      try{
+        const d=typeof row.value==="string"?JSON.parse(row.value):row.value;
+        const isOwner=d.players?.[0]?.id===profile.id;
+        const isActive=!d.game?.winner&&!d.game?.isDraw;
+        const isStale=d.createdAt&&(Date.now()-d.createdAt)>7200000;
+        if(isOwner&&isActive&&!isStale) activeOwned++;
+      }catch(_){}
+    }
+    if(activeOwned>=cap){
+      setCreateErr(`You already have ${cap} active rooms. Finish them before creating another.`);
+      return;
+    }
     const id=genId(5);
-    await saveRoom(id,{id,players:[{id:profile?.id||("guest_"+genId(6)),symbol:X,username:profile?.username||null,elo:profile?.elo||null,profileId:profile?.id||null}],game:initGame(),createdAt:Date.now()});
+    await saveRoom(id,{
+      id,
+      players:[{id:profile.id,symbol:X,username:profile.username,elo:profile.elo||null,profileId:profile.id}],
+      game:initGame(),
+      createdAt:Date.now(),
+      isPublic,
+    },session.access_token);
+    setCreating(false);
     onJoin(id);
   }
+
   const tabStyle=(active)=>({flex:1,padding:"10px 0",background:active?C.accent:"transparent",color:active?C.bg:C.muted,border:"none",fontWeight:700,fontSize:14,cursor:"pointer"});
+
   return (
     <div style={{animation:"fadeIn 0.3s ease",maxWidth:400,margin:"0 auto",padding:"clamp(16px,4vw,32px)"}}>
       <button onClick={onBack} style={{background:"transparent",border:"none",color:C.muted,cursor:"pointer",fontSize:14,marginBottom:20}}>← Back</button>
       <h2 style={{fontFamily:"'Orbitron',monospace",color:C.accent,fontSize:20,marginBottom:16}}>Online Play</h2>
-      {profile&&<div style={{padding:"8px 14px",background:C.card,borderRadius:8,border:`1px solid ${C.border}`,marginBottom:16,fontSize:13,color:C.muted}}>Playing as <span style={{color:C.accent,fontWeight:700}}>{profile.username}</span> · ELO <span style={{color:C.text,fontWeight:700}}>{profile.elo||STARTING_ELO}</span></div>}
+      {profile&&<div style={{padding:"8px 14px",background:C.card,borderRadius:8,border:`1px solid ${C.border}`,marginBottom:16,fontSize:13,color:C.muted}}>
+        Playing as <span style={{color:C.accent,fontWeight:700}}>{profile.username}</span> · ELO <span style={{color:C.text,fontWeight:700}}>{profile.elo||STARTING_ELO}</span>
+      </div>}
+
+      {/* Tabs */}
       <div style={{display:"flex",borderRadius:10,overflow:"hidden",border:`1px solid ${C.border}`,marginBottom:20}}>
         {profile&&<button style={tabStyle(tab==="quick")} onClick={()=>setTab("quick")}>⚡ Quick Play</button>}
         <button style={tabStyle(tab==="room")} onClick={()=>setTab("room")}>🔑 Room Code</button>
       </div>
-      {tab==="quick"&&profile&&<QuickPlay profile={profile} onJoin={onJoin}/>}
+
+      {tab==="quick"&&profile&&<QuickPlay profile={profile} session={session} onJoin={onJoin}/>}
+
       {tab==="room"&&<>
-        <button onClick={create} style={{width:"100%",padding:"14px 0",background:`linear-gradient(135deg,${C.accent},${C.accentDim})`,color:C.bg,border:"none",borderRadius:10,fontWeight:700,fontSize:16,cursor:"pointer",marginBottom:16}}>+ Create Room</button>
+        {/* Create room button — signed-in users only */}
+        {profile ? (
+          <button
+            onClick={()=>{setCreating(true);setCreateErr("");setIsPublic(true);}}
+            style={{width:"100%",padding:"14px 0",background:`linear-gradient(135deg,${C.accent},${C.accentDim})`,color:C.bg,border:"none",borderRadius:10,fontWeight:700,fontSize:16,cursor:"pointer",marginBottom:16}}>
+            + Create Room
+          </button>
+        ) : (
+          <div style={{padding:"12px 14px",background:C.card,border:`1px solid ${C.border}`,borderRadius:10,marginBottom:16,fontSize:13,color:C.muted,textAlign:"center",lineHeight:1.6}}>
+            <span style={{color:C.text}}>Sign in</span> to create rooms.<br/>
+            Guests can join public rooms or enter a room code.
+          </div>
+        )}
+
+        {/* Join by code */}
         <div style={{display:"flex",gap:8,marginBottom:20}}>
-          <input value={code} onChange={e=>setCode(e.target.value.toUpperCase().slice(0,6))} placeholder="Room Code" style={{flex:1,padding:"12px 14px",background:C.surface,border:`1px solid ${C.border}`,borderRadius:10,color:C.text,fontFamily:"'Orbitron',monospace",fontSize:14,outline:"none",letterSpacing:2}}/>
-          <button onClick={()=>code.length>=4&&onJoin(code)} style={{padding:"12px 16px",background:C.o,color:"#fff",border:"none",borderRadius:10,fontWeight:700,cursor:"pointer",fontSize:15}}>Join</button>
+          <input
+            value={code}
+            onChange={e=>setCode(e.target.value.toUpperCase().slice(0,6))}
+            placeholder="Room Code"
+            style={{flex:1,padding:"12px 14px",background:C.surface,border:`1px solid ${C.border}`,borderRadius:10,color:C.text,fontFamily:"'Orbitron',monospace",fontSize:14,outline:"none",letterSpacing:2}}
+          />
+          <button
+            onClick={()=>code.length>=4&&onJoin(code)}
+            style={{padding:"12px 16px",background:C.o,color:"#fff",border:"none",borderRadius:10,fontWeight:700,cursor:"pointer",fontSize:15}}>
+            Join
+          </button>
         </div>
-        {rooms.length>0&&<><p style={{fontSize:11,color:C.muted,marginBottom:8,letterSpacing:1}}>OPEN ROOMS</p>
+
+        {/* Public rooms list */}
+        {rooms.length>0&&<>
+          <p style={{fontSize:11,color:C.muted,marginBottom:8,letterSpacing:1}}>PUBLIC ROOMS</p>
           {rooms.map(r=>(
-            <div key={r.id} onClick={()=>onJoin(r.id)} style={{padding:"12px 16px",background:C.card,border:`1px solid ${C.border}`,borderRadius:8,marginBottom:8,cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center"}}
-              onMouseEnter={e=>e.currentTarget.style.borderColor=C.accent} onMouseLeave={e=>e.currentTarget.style.borderColor=C.border}>
-              <span style={{fontFamily:"'Orbitron',monospace",color:C.accent,letterSpacing:2}}>{r.id}</span>
-              <span style={{fontSize:12,color:C.muted}}>1/2 · Join</span>
+            <div key={r.id} onClick={()=>onJoin(r.id)}
+              style={{padding:"12px 16px",background:C.card,border:`1px solid ${C.border}`,borderRadius:8,marginBottom:8,cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",transition:"border-color 0.2s"}}
+              onMouseEnter={e=>e.currentTarget.style.borderColor=C.accent}
+              onMouseLeave={e=>e.currentTarget.style.borderColor=C.border}>
+              <div>
+                <span style={{fontFamily:"'Orbitron',monospace",color:C.accent,letterSpacing:2,fontSize:14}}>{r.id}</span>
+                <span style={{fontSize:12,color:C.muted,marginLeft:10}}>hosted by <span style={{color:C.text}}>{r.host}</span></span>
+              </div>
+              <div style={{display:"flex",alignItems:"center",gap:8}}>
+                {r.elo&&<span style={{fontSize:11,color:C.muted}}>{r.elo} ELO</span>}
+                <span style={{fontSize:11,color:C.success,fontWeight:600}}>Join →</span>
+              </div>
             </div>
-          ))}</>}
-        {!profile&&<p style={{fontSize:12,color:C.muted,textAlign:"center",marginTop:16,lineHeight:1.5}}>💡 Sign in to use Quick Play and earn ELO.</p>}
+          ))}
+        </>}
+        {rooms.length===0&&<p style={{color:C.muted,fontSize:13,textAlign:"center",marginTop:8}}>No public rooms open — create one or enter a code.</p>}
       </>}
+
+      {/* Create room modal */}
+      {creating&&(
+        <div style={{position:"fixed",inset:0,zIndex:200,background:"rgba(0,0,0,0.85)",display:"flex",alignItems:"center",justifyContent:"center",backdropFilter:"blur(6px)"}}>
+          <div style={{background:C.card,border:`2px solid ${C.border}`,borderRadius:16,padding:"clamp(20px,4vw,32px)",maxWidth:340,width:"90%",animation:"slideUp 0.3s ease"}}>
+            <h3 style={{fontFamily:"'Orbitron',monospace",color:C.accent,fontSize:16,marginBottom:20}}>Create Room</h3>
+
+            {/* Public / Private toggle */}
+            <p style={{fontSize:12,color:C.muted,marginBottom:10,letterSpacing:0.5}}>VISIBILITY</p>
+            <div style={{display:"flex",gap:8,marginBottom:20}}>
+              {[
+                {key:true,  icon:"🌐", label:"Public",  desc:"Listed in open rooms"},
+                {key:false, icon:"🔒", label:"Private", desc:"Join by code only"},
+              ].map(opt=>(
+                <button key={String(opt.key)} onClick={()=>setIsPublic(opt.key)} style={{
+                  flex:1,padding:"12px 8px",borderRadius:10,cursor:"pointer",textAlign:"center",
+                  border:`2px solid ${isPublic===opt.key?(opt.key?C.success:C.o):C.border}`,
+                  background:isPublic===opt.key?(opt.key?"rgba(61,186,120,0.1)":"rgba(56,180,245,0.1)"):"transparent",
+                  transition:"all 0.2s",
+                }}>
+                  <div style={{fontSize:20,marginBottom:4}}>{opt.icon}</div>
+                  <div style={{fontFamily:"'Orbitron',monospace",fontSize:11,color:isPublic===opt.key?(opt.key?C.success:C.o):C.muted,fontWeight:700}}>{opt.label}</div>
+                  <div style={{fontSize:10,color:C.muted,marginTop:2}}>{opt.desc}</div>
+                </button>
+              ))}
+            </div>
+
+            {/* Info box */}
+            <div style={{padding:"10px 12px",background:C.surface,borderRadius:8,border:`1px solid ${C.border}`,marginBottom:16,fontSize:12,color:"#b8b8d0",lineHeight:1.5}}>
+              {isPublic
+                ? "Your room will appear in the public list. Anyone can join."
+                : "Your room won't be listed. Share the room code with your opponent to invite them."}
+            </div>
+
+            {createErr&&<p style={{color:C.err,fontSize:12,marginBottom:12}}>{createErr}</p>}
+
+            <div style={{display:"flex",gap:8}}>
+              <button onClick={()=>setCreating(false)} style={{flex:1,padding:"11px 0",background:"transparent",border:`1px solid ${C.border}`,color:C.muted,borderRadius:8,fontWeight:600,fontSize:14,cursor:"pointer"}}>Cancel</button>
+              <button onClick={create} style={{flex:2,padding:"11px 0",background:isPublic?`linear-gradient(135deg,${C.success},#2a8a5a)`:`linear-gradient(135deg,${C.o},#1a6a9a)`,color:"#fff",border:"none",borderRadius:8,fontWeight:700,fontSize:14,cursor:"pointer"}}>
+                Create {isPublic?"Public":"Private"} Room
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1266,13 +1472,20 @@ function AuthScreen({onAuth,onBack,onSuccess}) {
   const [password,setPassword]=useState("");
   const [msg,setMsg]=useState("");
   const [loading,setLoading]=useState(false);
+  const [captchaToken,setCaptchaToken]=useState(null);
+  const [captchaError,setCaptchaError]=useState(false);
   const {signUp,signIn}=onAuth;
+  useTurnstileScript();
 
   async function handleSubmit(){
     if(!username.trim()||!password.trim()){setMsg("Fill in all fields.");return;}
     if(username.length<3){setMsg("Username must be 3+ characters.");return;}
     if(password.length<6){setMsg("Password must be 6+ characters.");return;}
     if(!/^[a-zA-Z0-9_]+$/.test(username)){setMsg("Username: letters, numbers, underscores only.");return;}
+    // CAPTCHA check on registration only
+    if(tab==="register" && turnstileEnabled() && !captchaToken){
+      setMsg("Please complete the security check.");return;
+    }
     setLoading(true);setMsg("");
     const result = tab==="register"
       ? await signUp(username.trim(), password)
@@ -1289,13 +1502,23 @@ function AuthScreen({onAuth,onBack,onSuccess}) {
       <h2 style={{fontFamily:"'Orbitron',monospace",color:C.accent,fontSize:20,marginBottom:24}}>Account</h2>
       <div style={{display:"flex",borderRadius:10,overflow:"hidden",border:`1px solid ${C.border}`,marginBottom:24}}>
         {["login","register"].map(t=>(
-          <button key={t} onClick={()=>{setTab(t);setMsg("");}} style={{flex:1,padding:"10px 0",background:tab===t?C.accent:"transparent",color:tab===t?C.bg:C.muted,border:"none",fontWeight:700,fontSize:14,cursor:"pointer"}}>{t==="login"?"Sign In":"Register"}</button>
+          <button key={t} onClick={()=>{setTab(t);setMsg("");setCaptchaToken(null);}} style={{flex:1,padding:"10px 0",background:tab===t?C.accent:"transparent",color:tab===t?C.bg:C.muted,border:"none",fontWeight:700,fontSize:14,cursor:"pointer"}}>{t==="login"?"Sign In":"Register"}</button>
         ))}
       </div>
       <input value={username} onChange={e=>setUsername(e.target.value)} placeholder="Username" style={inputStyle} autoCapitalize="none" autoCorrect="off" autoComplete="username"/>
       <input value={password} onChange={e=>setPassword(e.target.value)} placeholder="Password" type="password" style={inputStyle} autoComplete={tab==="register"?"new-password":"current-password"}/>
+      {tab==="register" && turnstileEnabled() && (
+        <div style={{marginBottom:12}}>
+          <TurnstileWidget
+            onVerify={token=>{setCaptchaToken(token);setCaptchaError(false);}}
+            onError={()=>{setCaptchaError(true);setMsg("Security check failed. Please try again.");}}
+          />
+          {captchaToken&&<p style={{fontSize:11,color:C.success,textAlign:"center",marginTop:6}}>✓ Verified</p>}
+          {captchaError&&<p style={{fontSize:11,color:C.err,textAlign:"center",marginTop:6}}>Security check failed — refresh and try again.</p>}
+        </div>
+      )}
       {msg&&<p style={{color:C.err,fontSize:13,marginBottom:12}}>{msg}</p>}
-      <button onClick={handleSubmit} disabled={loading} style={{width:"100%",padding:"13px 0",background:`linear-gradient(135deg,${C.accent},${C.accentDim})`,color:C.bg,border:"none",borderRadius:10,fontWeight:700,fontSize:16,cursor:"pointer",opacity:loading?0.7:1}}>
+      <button onClick={handleSubmit} disabled={loading||(tab==="register"&&turnstileEnabled()&&!captchaToken)} style={{width:"100%",padding:"13px 0",background:`linear-gradient(135deg,${C.accent},${C.accentDim})`,color:C.bg,border:"none",borderRadius:10,fontWeight:700,fontSize:16,cursor:"pointer",opacity:(loading||(tab==="register"&&turnstileEnabled()&&!captchaToken))?0.5:1}}>
         {loading?"…":tab==="login"?"Sign In":"Create Account"}
       </button>
       <p style={{color:"#b8b8d0",fontSize:13,marginTop:16,textAlign:"center",lineHeight:1.5}}>
@@ -1350,24 +1573,21 @@ function DifficultyPicker({onSelect,onBack}) {
       key:"easy",
       icon:"🟢",
       label:"Easy",
-      desc:"The CPU plays the 5th-best move most of the time. Good for learning the game.",
-      best:"5% chance of best move",
+      desc:"A relaxed opponent that makes frequent mistakes. Great for learning the rules and basic strategy.",
       color:"#3dba78",
     },
     {
       key:"medium",
       icon:"🟡",
       label:"Medium",
-      desc:"A genuine challenge. The CPU mixes good and great moves.",
-      best:"15% chance of best move",
+      desc:"A balanced challenge. The CPU plays well but makes the occasional error — you can win with good play.",
       color:"#f0c040",
     },
     {
       key:"hard",
       icon:"🔴",
       label:"Hard",
-      desc:"The CPU plays strongly. It always sees 2 moves ahead and rarely wastes a turn.",
-      best:"35% chance of best move",
+      desc:"A strong opponent that plans ahead and rarely blunders. Expect a fight.",
       color:"#ff4444",
     },
   ];
@@ -1377,7 +1597,7 @@ function DifficultyPicker({onSelect,onBack}) {
       <button onClick={onBack} style={{background:"transparent",border:"none",color:C.muted,cursor:"pointer",fontSize:14,marginBottom:20}}>← Back</button>
       <h2 style={{fontFamily:"'Orbitron',monospace",color:C.accent,fontSize:20,marginBottom:6}}>vs Computer</h2>
       <p style={{color:"#b8b8d0",fontSize:13,marginBottom:24,lineHeight:1.5}}>
-        All difficulties use the same 2-ply AI — harder levels just act on it more reliably.
+        Choose your challenge.
       </p>
       <div style={{display:"flex",flexDirection:"column",gap:12}}>
         {tiers.map(t=>(
@@ -1396,7 +1616,6 @@ function DifficultyPicker({onSelect,onBack}) {
             <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:6}}>
               <span style={{fontSize:22}}>{t.icon}</span>
               <span style={{fontFamily:"'Orbitron',monospace",fontSize:16,color:t.color,fontWeight:700}}>{t.label}</span>
-              <span style={{marginLeft:"auto",fontSize:11,color:C.muted}}>{t.best}</span>
             </div>
             <p style={{fontSize:13,color:"#b8b8d0",lineHeight:1.5,margin:0}}>{t.desc}</p>
           </button>
@@ -1492,8 +1711,8 @@ export default function App() {
           {screen==="difficulty"&&<DifficultyPicker onSelect={d=>{setAiDifficulty(d);setScreen("vs-ai");}} onBack={()=>setScreen("home")}/>}
           {screen==="vs-ai"&&<GameScreen mode="vs-ai" difficulty={aiDifficulty} profile={profile} updateProfile={updateProfile} onHome={()=>setScreen("home")}/>}
           {screen==="local"&&<GameScreen mode="local" profile={profile} updateProfile={updateProfile} onHome={()=>setScreen("home")}/>}
-          {screen==="online-lobby"&&<OnlineLobby profile={profile} onJoin={id=>{setRoomId(id);setScreen("online");}} onBack={()=>setScreen("home")}/>}
-          {screen==="online"&&roomId&&<GameScreen mode="online" roomId={roomId} profile={profile} updateProfile={updateProfile} onHome={()=>setScreen("home")}/>}
+          {screen==="online-lobby"&&<OnlineLobby profile={profile} session={session} onJoin={id=>{setRoomId(id);setScreen("online");}} onBack={()=>setScreen("home")}/>}
+          {screen==="online"&&roomId&&<GameScreen mode="online" roomId={roomId} profile={profile} session={session} updateProfile={updateProfile} onHome={()=>setScreen("home")}/>}
           {screen==="stats"&&profile&&<StatsScreen profile={profile} onBack={()=>setScreen("home")}/>}
           {screen==="auth"&&<AuthScreen onAuth={authHandlers} onBack={()=>setScreen("home")} onSuccess={()=>setScreen("home")}/>}
           {screen==="instructions"&&<Instructions onBack={()=>setScreen("home")}/>}

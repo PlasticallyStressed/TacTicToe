@@ -86,6 +86,19 @@ const supa = {
       headers:{ ...this._h(token||null), Prefer:"resolution=merge-duplicates,return=representation" },
       body: JSON.stringify({ key, value: serialized, updated_at: new Date().toISOString() }),
     });
+    if (!r.ok) console.warn("kvSet failed:", r.status, await r.text().catch(()=>""));
+    return r.ok;
+  },
+  // kvPatch — pure UPDATE on an existing row, no insert. Safe for guests (no auth needed).
+  async kvPatch(key, value) {
+    const serialized = JSON.stringify(value);
+    if (serialized.length > 32768) { console.warn("kvPatch: payload too large"); return false; }
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/kv?key=eq.${encodeURIComponent(key)}`, {
+      method:"PATCH",
+      headers:{ ...this._h(null), Prefer:"return=representation" },
+      body: JSON.stringify({ value: serialized, updated_at: new Date().toISOString() }),
+    });
+    if (!r.ok) console.warn("kvPatch failed:", r.status, await r.text().catch(()=>""));
     return r.ok;
   },
   async kvDel(key, token) {
@@ -546,6 +559,13 @@ async function kvSet(key, val, token) {
   }
   return supa.kvSet(key, val, token);
 }
+// kvPatch — update only, no insert, no auth required. Used for guest joins.
+async function kvPatch(key, val) {
+  if (!isConfigured()) {
+    try { await window.storage.set(key,JSON.stringify(val),true); } catch{}; return;
+  }
+  return supa.kvPatch(key, val);
+}
 async function kvDel(key, token) {
   if (!isConfigured()) {
     try { await window.storage.delete(key,true); } catch{}; return;
@@ -559,8 +579,16 @@ async function kvList(prefix) {
   return supa.kvList(prefix);
 }
 
-// Room helpers — token required for writes
-async function saveRoom(rid, data, token) { await kvSet(`ttt:r:${rid}`, data, token); }
+// Room helpers
+// saveRoom: if token provided = authenticated write (create or update)
+//           if no token = guest joining existing room, use PATCH (update only)
+async function saveRoom(rid, data, token) {
+  if (token) {
+    await kvSet(`ttt:r:${rid}`, data, token);
+  } else {
+    await kvPatch(`ttt:r:${rid}`, data);
+  }
+}
 async function loadRoom(rid) { return await kvGet(`ttt:r:${rid}`); }
 async function listRoomKeys() {
   const rows = await kvList("ttt:r:");
@@ -1002,11 +1030,10 @@ function GameScreen({mode,roomId,profile,session,updateProfile,onHome,difficulty
       if(data.players.length>=2) return;
       const sym=O;
       data.players.push({id:myId,symbol:sym,username:profile?.username||null,elo:profile?.elo||null,profileId:profile?.id||null});
-      // Guests don't have a session token — use anon key for join writes.
-      // This is safe: room creation requires auth (capped), joining only
-      // adds a player to an already-existing room with a known ID.
-      const writeToken = session?.access_token || SUPABASE_ANON;
-      await saveRoom(roomId,data,writeToken);
+      // Pass session token if available (registered user), or null (guest).
+      // saveRoom handles the difference: authenticated users use upsert,
+      // guests use PATCH (update-only) which the DB allows without auth.
+      await saveRoom(roomId, data, session?.access_token || null);
     }
     const me=data.players.find(p=>p.id===myId);
     if(me) setMyOnlineSym(me.symbol);

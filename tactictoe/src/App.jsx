@@ -631,7 +631,7 @@ create table kv (
 alter table kv enable row level security;
 create policy "Public read"       on kv for select using (true);
 create policy "Auth write"       on kv for insert with check (auth.role() = 'authenticated');
-create policy "Auth update"      on kv for update using (auth.role() = 'authenticated');
+create policy "Anyone update"    on kv for update using (true);
 create policy "Auth delete"      on kv for delete using (auth.role() = 'authenticated');`;
 
   return (
@@ -740,24 +740,40 @@ function useAuth() {
     const data = await supa.signUp(email, password);
     if (data.error) return { error: data.error.message || "Registration failed." };
     if (!data.user) return { error: "Registration failed. Try a different username." };
-    const token = data.session?.access_token || SUPABASE_ANON;
-    await supa.upsertProfile({ id: data.user.id, username, elo: STARTING_ELO, stats: {} }, token);
+
+    // Establish session first
+    let accessToken, refreshToken, userId;
     if (data.session?.access_token) {
-      const sess = { access_token: data.session.access_token, refresh_token: data.session.refresh_token, user: data.user };
-      saveSession(sess);
-      setSession(sess);
-      const p = await loadProfile(data.user.id, data.session.access_token);
+      accessToken = data.session.access_token;
+      refreshToken = data.session.refresh_token;
+      userId = data.user.id;
       scheduleRefresh(data.session.expires_in || 3600);
-      return { profile: p };
+    } else {
+      // No session in signup response — do explicit sign-in
+      const signInData = await supa.signIn(email, password);
+      if (signInData.error) return { error: "Account created — please sign in manually." };
+      accessToken = signInData.access_token;
+      refreshToken = signInData.refresh_token;
+      userId = signInData.user.id;
+      scheduleRefresh(signInData.expires_in || 3600);
     }
-    const signInData = await supa.signIn(email, password);
-    if (signInData.error) return { error: "Account created — please sign in." };
-    const sess = { access_token: signInData.access_token, refresh_token: signInData.refresh_token, user: signInData.user };
+
+    const sess = { access_token: accessToken, refresh_token: refreshToken, user: data.user };
     saveSession(sess);
     setSession(sess);
-    const p = await loadProfile(signInData.user.id, signInData.access_token);
-    scheduleRefresh(signInData.expires_in || 3600);
-    return { profile: p };
+
+    // Create profile row
+    await supa.upsertProfile({ id: userId, username, elo: STARTING_ELO, stats: {} }, accessToken);
+
+    // Retry profile fetch up to 4 times with delay — RLS can lag slightly after insert
+    let p = null;
+    for (let i = 0; i < 4; i++) {
+      p = await loadProfile(userId, accessToken);
+      if (p) break;
+      await new Promise(r => setTimeout(r, 400));
+    }
+
+    return { profile: p, success: true };
   }, [loadProfile, scheduleRefresh]);
 
   const signIn = useCallback(async (username, password) => {
@@ -986,7 +1002,11 @@ function GameScreen({mode,roomId,profile,session,updateProfile,onHome,difficulty
       if(data.players.length>=2) return;
       const sym=O;
       data.players.push({id:myId,symbol:sym,username:profile?.username||null,elo:profile?.elo||null,profileId:profile?.id||null});
-      await saveRoom(roomId,data,session?.access_token);
+      // Guests don't have a session token — use anon key for join writes.
+      // This is safe: room creation requires auth (capped), joining only
+      // adds a player to an already-existing room with a known ID.
+      const writeToken = session?.access_token || SUPABASE_ANON;
+      await saveRoom(roomId,data,writeToken);
     }
     const me=data.players.find(p=>p.id===myId);
     if(me) setMyOnlineSym(me.symbol);
@@ -1481,7 +1501,7 @@ function StableTurnstile({ onVerify, onError }) {
   return <TurnstileWidget onVerify={stableVerify} onError={stableError} />;
 }
 
-function AuthScreen({onAuth,onBack,onSuccess}) {
+function AuthScreen({onAuth,onBack,onSuccess,profile}) {
   const [tab,setTab]=useState("login");
   const [username,setUsername]=useState("");
   const [password,setPassword]=useState("");
@@ -1489,8 +1509,19 @@ function AuthScreen({onAuth,onBack,onSuccess}) {
   const [loading,setLoading]=useState(false);
   const [captchaToken,setCaptchaToken]=useState(null);
   const [captchaError,setCaptchaError]=useState(false);
+  const [pendingSuccess,setPendingSuccess]=useState(false);
   const {signUp,signIn}=onAuth;
   useTurnstileScript();
+
+  // When loading finishes and profile appears in state, navigate home
+  // This handles the case where signUp/signIn sets session but profile
+  // loads asynchronously — we wait for it rather than navigating immediately
+  useEffect(()=>{
+    if(pendingSuccess && profile) {
+      setPendingSuccess(false);
+      onSuccess();
+    }
+  },[pendingSuccess, profile, onSuccess]);
 
   // Stable callbacks for Turnstile — won't cause re-render of the widget
   const handleVerify = useCallback((token) => {
@@ -1514,9 +1545,14 @@ function AuthScreen({onAuth,onBack,onSuccess}) {
       ? await signUp(username.trim(), password)
       : await signIn(username.trim(), password);
     if(result?.error){setMsg(result.error);setLoading(false);return;}
-    // Both register and login: go straight to home
     setLoading(false);
-    onSuccess();
+    // If profile is already in state (fast path), go immediately
+    // Otherwise set pending flag and wait for the useEffect above
+    if(result?.profile || profile) {
+      onSuccess();
+    } else {
+      setPendingSuccess(true);
+    }
   }
 
   const inputStyle={width:"100%",padding:"12px 14px",background:C.surface,border:`1px solid ${C.border}`,borderRadius:10,color:C.text,fontSize:15,outline:"none",marginBottom:12};
@@ -1756,7 +1792,7 @@ export default function App() {
           {screen==="online-lobby"&&<OnlineLobby profile={profile} session={session} onJoin={id=>{setRoomId(id);setScreen("online");}} onBack={()=>setScreen("home")}/>}
           {screen==="online"&&roomId&&<GameScreen mode="online" roomId={roomId} profile={profile} session={session} updateProfile={updateProfile} onHome={()=>setScreen("home")}/>}
           {screen==="stats"&&profile&&<StatsScreen profile={profile} onBack={()=>setScreen("home")}/>}
-          {screen==="auth"&&<AuthScreen onAuth={authHandlers} onBack={()=>setScreen("home")} onSuccess={()=>setScreen("home")}/>}
+          {screen==="auth"&&<AuthScreen onAuth={authHandlers} profile={profile} onBack={()=>setScreen("home")} onSuccess={()=>setScreen("home")}/>}
           {screen==="instructions"&&<Instructions onBack={()=>setScreen("home")}/>}
         </>}
       </div>

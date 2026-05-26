@@ -317,7 +317,7 @@ const C={
   accent:"#f0c040",accentDim:"#8a6c18",
   x:"#ff4444",xDim:"rgba(255,68,68,0.15)",
   o:"#38b4f5",oDim:"rgba(56,180,245,0.15)",
-  draw:"#7a7a9a",text:"#eeeef8",muted:"#5a5a80",
+  draw:"#7a7a9a",text:"#eeeef8",muted:"#9a9ab8",
   success:"#3dba78",err:"#ff5555",
   minorBg:"#1e1e32",minorBorder:"#3a3a58",
 };
@@ -388,7 +388,7 @@ create policy "Public delete" on kv for delete using (true);`;
             <div style={{width:28,height:28,borderRadius:"50%",background:C.accent,color:C.bg,fontFamily:"'Orbitron',monospace",fontWeight:700,fontSize:13,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>{n}</div>
             <div>
               <div style={{fontWeight:700,fontSize:14,color:C.text,marginBottom:2}}>{title}</div>
-              <div style={{fontSize:13,color:C.muted,lineHeight:1.5}}>{desc}</div>
+              <div style={{fontSize:13,color:"#b8b8d0",lineHeight:1.5}}>{desc}</div>
             </div>
           </div>
         ))}
@@ -893,7 +893,7 @@ function QuickPlay({profile,onJoin}) {
       {phase==="idle"&&<>
         <div style={{fontSize:48,marginBottom:12}}>⚡</div>
         <p style={{color:C.text,fontSize:16,fontWeight:600,marginBottom:6}}>Quick Play</p>
-        <p style={{color:C.muted,fontSize:13,marginBottom:20,lineHeight:1.5}}>Matched by ELO. Prefers ±{QP_ELO_WINDOW} pts, expands after {QP_RELAX_MS/1000}s.</p>
+        <p style={{color:"#b8b8d0",fontSize:13,marginBottom:20,lineHeight:1.5}}>Matched by ELO. Prefers ±{QP_ELO_WINDOW} pts, expands after {QP_RELAX_MS/1000}s.</p>
         <div style={{padding:"10px 16px",background:C.card,borderRadius:8,border:`1px solid ${C.border}`,marginBottom:20,display:"inline-block"}}>
           <span style={{fontSize:13,color:C.muted}}>Your ELO: </span>
           <span style={{fontFamily:"'Orbitron',monospace",color:C.accent,fontWeight:700}}>{profile.elo||STARTING_ELO}</span>
@@ -1003,7 +1003,7 @@ function StatsScreen({profile,onBack}) {
       <div style={{padding:"20px 24px",background:C.card,border:`2px solid ${eloColor}44`,borderRadius:14,marginBottom:20,textAlign:"center"}}>
         <p style={{fontSize:11,color:C.muted,letterSpacing:2,marginBottom:4}}>ELO RATING</p>
         <p style={{fontFamily:"'Orbitron',monospace",fontSize:42,fontWeight:900,color:eloColor,lineHeight:1}}>{elo}</p>
-        <p style={{fontSize:13,color:C.muted,marginTop:6}}>{eloTier}</p>
+        <p style={{fontSize:13,color:"#b8b8d0",marginTop:6}}>{eloTier}</p>
       </div>
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
         {cards.map(({l,v,c})=>(
@@ -1070,7 +1070,7 @@ function AuthScreen({onAuth,onBack,onSuccess}) {
       <button onClick={handleSubmit} disabled={loading} style={{width:"100%",padding:"13px 0",background:`linear-gradient(135deg,${C.accent},${C.accentDim})`,color:C.bg,border:"none",borderRadius:10,fontWeight:700,fontSize:16,cursor:"pointer",opacity:loading?0.7:1}}>
         {loading?"…":tab==="login"?"Sign In":"Create Account"}
       </button>
-      <p style={{color:C.muted,fontSize:12,marginTop:16,textAlign:"center",lineHeight:1.5}}>
+      <p style={{color:"#b8b8d0",fontSize:13,marginTop:16,textAlign:"center",lineHeight:1.5}}>
         {tab==="login"?"No account? Switch to Register above.":"Passwords are handled securely by Supabase — never stored in plain text."}
       </p>
     </div>
@@ -1100,13 +1100,13 @@ function Instructions({onBack}) {
               <span style={{fontSize:20}}>{icon}</span>
               <span style={{fontFamily:"'Orbitron',monospace",fontSize:12,color:C.accent}}>{title}</span>
             </div>
-            <p style={{fontSize:"clamp(12px,2.8vw,14px)",color:C.text,lineHeight:1.65}}>{text}</p>
+            <p style={{fontSize:"clamp(13px,2.8vw,15px)",color:"#d8d8ee",lineHeight:1.65}}>{text}</p>
           </div>
         ))}
       </div>
       <div style={{marginTop:16,padding:"14px 16px",background:"rgba(240,192,64,0.05)",border:`1px solid ${C.accentDim}`,borderRadius:10}}>
         <p style={{fontSize:13,color:C.accent,fontWeight:600,marginBottom:4}}>💡 ELO Rating</p>
-        <p style={{fontSize:13,color:C.muted,lineHeight:1.6}}>Online games between two registered players use chess-style ELO (K=32). Games vs guests use a fixed ±{GUEST_ELO_CHANGE}. Starting ELO: {STARTING_ELO}.</p>
+        <p style={{fontSize:13,color:"#b8b8d0",lineHeight:1.6}}>Online games between two registered players use chess-style ELO (K=32). Games vs guests use a fixed ±{GUEST_ELO_CHANGE}. Starting ELO: {STARTING_ELO}.</p>
       </div>
     </div>
   );
@@ -1134,7 +1134,7 @@ function HomeScreen({profile,onSelect,onSignOut}) {
     <div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",minHeight:"100dvh",padding:"clamp(20px,5vw,48px)",animation:"fadeIn 0.5s ease"}}>
       <div style={{textAlign:"center",marginBottom:"clamp(24px,5vw,44px)"}}>
         <div style={{fontFamily:"'Orbitron',monospace",fontSize:"clamp(28px,8vw,52px)",fontWeight:900,color:C.accent,letterSpacing:"clamp(2px,1vw,6px)",lineHeight:1,animation:"glow 3s infinite"}}>TAC TIC TOE</div>
-        <div style={{fontSize:"clamp(9px,2vw,12px)",color:C.muted,marginTop:8,letterSpacing:"clamp(2px,1vw,5px)",textTransform:"uppercase"}}>Ultimate Tic-Tac-Toe</div>
+        <div style={{fontSize:"clamp(10px,2vw,13px)",color:"#b8b8d0",marginTop:8,letterSpacing:"clamp(2px,1vw,5px)",textTransform:"uppercase"}}>Ultimate Tic-Tac-Toe</div>
         <div style={{display:"flex",gap:5,justifyContent:"center",marginTop:16}}>
           {[C.x,C.o,C.x,C.o,C.accent,C.o,C.x,C.o,C.x].map((col,i)=>(
             <div key={i} style={{width:"clamp(5px,1.3vw,9px)",height:"clamp(5px,1.3vw,9px)",borderRadius:2,background:col,opacity:0.75,animation:`fadeIn 0.4s ease ${i*0.05}s both`}}/>

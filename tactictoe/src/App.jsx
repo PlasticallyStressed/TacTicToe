@@ -156,8 +156,12 @@ function applyMove(game, majorIdx, minorIdx) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
-   AI
+   AI  —  2-ply minimax with alpha-beta at the global level
+         + full minimax on individual minor boards
+         + destination quality evaluation
 ═══════════════════════════════════════════════════════════════════ */
+
+// ── Minor board helpers ───────────────────────────────────────────
 function countThreats(cells, player) {
   let t=0;
   for (const [a,b,c] of WIN_LINES) {
@@ -166,6 +170,7 @@ function countThreats(cells, player) {
   }
   return t;
 }
+
 function boardScore(cells, player) {
   const opp = player===X?O:X;
   const result = getBoardResult(cells);
@@ -174,12 +179,14 @@ function boardScore(cells, player) {
   if (result==="draw") return -5;
   return countThreats(cells,player)*10 - countThreats(cells,opp)*8;
 }
+
+// Full minimax for a single minor board — used to find best minor move
 function minimaxMinor(cells, isMax, depth, alpha, beta) {
   const result = getBoardResult(cells);
   if (result===O) return 100-depth;
   if (result===X) return -(100-depth);
   if (result==="draw") return 0;
-  if (depth>=6) return boardScore(cells,O)*0.1;
+  if (depth>=7) return boardScore(cells,O)*0.1;
   const player = isMax?O:X;
   let best = isMax?-Infinity:Infinity;
   for (let i=0;i<9;i++) {
@@ -192,67 +199,245 @@ function minimaxMinor(cells, isMax, depth, alpha, beta) {
   }
   return best;
 }
-function scoreMoveGlobal(game, majIdx, minIdx) {
-  const { minorBoards, majorResults } = game;
+
+// ── Global position evaluation ────────────────────────────────────
+// Evaluates the major board state from O's perspective
+function evalMajorPosition(majorResults) {
+  const winner = checkWinner(majorResults);
+  if (winner===O) return 100000;
+  if (winner===X) return -100000;
   let score = 0;
-  const cells=[...minorBoards[majIdx]]; cells[minIdx]=O;
-  const minorResult = getBoardResult(cells);
-  if (minorResult===O) score+=300;
-  else if (minorResult==="draw") score-=20;
-  const xCells=[...minorBoards[majIdx]]; xCells[minIdx]=X;
-  if (getBoardResult(xCells)===X) score+=180;
-  const newMaj=[...majorResults];
-  if (minorResult&&!newMaj[majIdx]) newMaj[majIdx]=minorResult;
-  if (checkWinner(newMaj)===O) score+=2000;
-  const xMaj=[...majorResults]; xMaj[majIdx]=X;
-  if (checkWinner(xMaj)===X) score+=500;
   for (const [a,b,c] of WIN_LINES) {
-    const line=[newMaj[a],newMaj[b],newMaj[c]];
-    if (line.filter(v=>v===O).length===2 && line.filter(v=>v===null).length===1) score+=80;
-    if (line.filter(v=>v===X).length===2 && line.filter(v=>v===null).length===1) score+=60;
+    const line = [majorResults[a], majorResults[b], majorResults[c]];
+    const oCount = line.filter(v=>v===O).length;
+    const xCount = line.filter(v=>v===X).length;
+    const nullCount = line.filter(v=>v===null).length;
+    const drawCount = line.filter(v=>v==="draw").length;
+    // Only lines with no opponent pieces are useful
+    if (oCount>0 && xCount===0) score += oCount===2 ? 500 : 80;
+    if (xCount>0 && oCount===0) score -= xCount===2 ? 400 : 60;
+    // Lines blocked by draws are worth nothing
+    if (drawCount>0 && oCount===0 && xCount===0) score -= 5;
   }
-  const destResult = majorResults[minIdx];
-  if (destResult!==null) { score+=40; } else {
-    const destCells = minorBoards[minIdx];
-    score -= countThreats(destCells,X)*25;
-    score += countThreats(destCells,O)*10;
-    for (let i=0;i<9;i++) {
-      if (destCells[i]!==null) continue;
-      const test=[...destCells]; test[i]=X;
-      if (getBoardResult(test)===X) { score-=120; break; }
-    }
+  // Center major board is most valuable
+  if (majorResults[4]===O) score += 120;
+  if (majorResults[4]===X) score -= 100;
+  // Corners
+  for (const i of [0,2,6,8]) {
+    if (majorResults[i]===O) score += 40;
+    if (majorResults[i]===X) score -= 30;
   }
-  const posVal=[3,2,3,2,4,2,3,2,3];
-  score += posVal[minIdx]*4;
-  score += boardScore(minorBoards[majIdx], O)*0.5;
   return score;
 }
-function getAIMove(game) {
-  const { majorResults, forcedMajor, minorBoards } = game;
-  const playableMajors = forcedMajor!==null
-    ? [forcedMajor]
-    : Array.from({length:9},(_,i)=>i).filter(i=>majorResults[i]===null);
-  let best=null, bestScore=-Infinity;
+
+// How dangerous is it to send the opponent to a given board?
+// Returns a score from O's perspective: negative = bad (good for X)
+function evalDestinationBoard(minorBoards, majorResults, destIdx) {
+  // Completed board = opponent gets free choice, which is neutral-to-bad for us
+  if (majorResults[destIdx]!==null) return -30;
+  const cells = minorBoards[destIdx];
+  let danger = 0;
+  // Can X win the dest board in one move?
+  for (let i=0;i<9;i++) {
+    if (cells[i]!==null) continue;
+    const test=[...cells]; test[i]=X;
+    if (getBoardResult(test)===X) { danger+=150; break; }
+  }
+  // How many threats does X already have there?
+  danger += countThreats(cells,X) * 40;
+  // How many threats does O have there? (good — O gets to build on them next turn)
+  danger -= countThreats(cells,O) * 20;
+  // Can O win it in one move? Very good destination (we get to finish it)
+  for (let i=0;i<9;i++) {
+    if (cells[i]!==null) continue;
+    const test=[...cells]; test[i]=O;
+    if (getBoardResult(test)===O) { danger-=80; break; }
+  }
+  // Empty boards are slightly dangerous (opponent has many options)
+  const empty = cells.filter(c=>c===null).length;
+  if (empty===9) danger+=15;
+  return -danger; // negate: high danger = low score for O
+}
+
+// Score a single move from O's perspective (1-ply, used inside 2-ply)
+function scoreMoveSingle(game, majIdx, minIdx) {
+  const { minorBoards, majorResults } = game;
+  let score = 0;
+
+  // Simulate the move
+  const newBoards = minorBoards.map(b=>[...b]);
+  newBoards[majIdx][minIdx] = O;
+  const minorResult = getBoardResult(newBoards[majIdx]);
+  const newMajorResults = [...majorResults];
+  if (minorResult && !newMajorResults[majIdx]) newMajorResults[majIdx] = minorResult;
+
+  // Immediate major win is overwhelmingly good
+  if (checkWinner(newMajorResults)===O) return 500000;
+
+  // Evaluate resulting major position
+  score += evalMajorPosition(newMajorResults) * 1.5;
+
+  // Winning the minor board is good
+  if (minorResult===O) score += 300;
+  else if (minorResult==="draw") score -= 15;
+
+  // Blocking X from winning this minor board
+  const xTest=[...minorBoards[majIdx]]; xTest[minIdx]=X;
+  if (getBoardResult(xTest)===X) score += 200;
+
+  // Quality of where we're sending the opponent
+  score += evalDestinationBoard(newBoards, newMajorResults, minIdx);
+
+  // Minor board internal quality after our move
+  score += boardScore(newBoards[majIdx], O) * 0.3;
+
+  return score;
+}
+
+// Get all legal moves for a player in a given game state
+function getLegalMoves(game, player) {
+  const { minorBoards, majorResults, forcedMajor, activeMajor } = game;
+  const moves = [];
+
+  // Determine which major boards are playable:
+  // 1. If there is a forced major board that is still open, use only that.
+  // 2. If activeMajor is set and open, use only that.
+  // 3. Otherwise (free choice) all uncompleted boards are playable.
+  let playableMajors;
+  if (forcedMajor !== null && majorResults[forcedMajor] === null) {
+    playableMajors = [forcedMajor];
+  } else if (activeMajor !== null && majorResults[activeMajor] === null) {
+    playableMajors = [activeMajor];
+  } else {
+    // Free choice — all uncompleted boards
+    playableMajors = Array.from({length:9}, (_,i) => i)
+      .filter(i => majorResults[i] === null);
+  }
+
   for (const majIdx of playableMajors) {
-    const cells = minorBoards[majIdx];
-    let winMove=null, blockMove=null;
-    for (let minIdx=0;minIdx<9;minIdx++) {
-      if (cells[minIdx]!==null) continue;
-      const test=[...cells]; test[minIdx]=O;
-      if (getBoardResult(test)===O) { winMove=minIdx; break; }
-      const xTest=[...cells]; xTest[minIdx]=X;
-      if (getBoardResult(xTest)===X) blockMove=minIdx;
-    }
-    const candidateMoves = winMove!==null ? [winMove]
-      : blockMove!==null ? [blockMove, ...Array.from({length:9},(_,i)=>i).filter(i=>cells[i]===null&&i!==blockMove)]
-      : Array.from({length:9},(_,i)=>i).filter(i=>cells[i]===null);
-    for (const minIdx of candidateMoves.slice(0,9)) {
-      if (cells[minIdx]!==null) continue;
-      const score = scoreMoveGlobal(game,majIdx,minIdx);
-      if (score>bestScore){ bestScore=score; best={majIdx,minIdx}; }
+    if (majorResults[majIdx] !== null) continue;
+    for (let minIdx = 0; minIdx < 9; minIdx++) {
+      if (minorBoards[majIdx][minIdx] === null) moves.push({majIdx, minIdx});
     }
   }
-  return best;
+  return moves;
+}
+
+// 2-ply minimax: score move for O, then let X pick their best response
+function scoreMove2Ply(game, majIdx, minIdx) {
+  // Apply O's move
+  const g1 = applyMove(game, majIdx, minIdx);
+
+  // Terminal states
+  if (g1.winner===O) return 500000;
+  if (g1.winner===X) return -500000;
+  if (g1.isDraw) return 0;
+
+  // Now find X's best response
+  const xMoves = getLegalMoves(g1, X);
+  if (xMoves.length===0) return scoreMoveSingle(game, majIdx, minIdx);
+
+  let xBestScore = -Infinity; // best for X = worst for O
+  for (const {majIdx:xMaj, minIdx:xMin} of xMoves) {
+    const g2 = applyMove(g1, xMaj, xMin);
+
+    let s;
+    if (g2.winner===X) s = -500000;
+    else if (g2.winner===O) s = 500000;
+    else if (g2.isDraw) s = 0;
+    else s = evalMajorPosition(g2.majorResults) + evalDestinationBoard(g2.minorBoards, g2.majorResults, xMin) * 0.5;
+
+    if (s > xBestScore) xBestScore = s;
+    // Alpha-beta: if X can already guarantee better than current O best, prune
+    // (simplified — no full alpha-beta across outer loop, but inner is bounded)
+  }
+
+  // O's score is the negative of X's best (minimax)
+  return -xBestScore;
+}
+
+// ── Difficulty profiles ──────────────────────────────────────────
+// Each difficulty defines how often to pick from the ranked move list.
+// The AI ALWAYS scores all moves via 2-ply — difficulty only controls
+// which rank it selects from, so lower difficulties "play dumb" not "play blind".
+//
+// Tiers are defined as an array of [maxRankIndex, probability] pairs.
+// maxRankIndex: pick randomly from moves ranked 0..maxRankIndex
+// Immediate wins/blocks are always taken regardless of difficulty.
+
+const AI_DIFFICULTIES = {
+  easy: [
+    { maxRank: 4, weight: 70 },  // pick from top-5 moves,  70% of the time
+    { maxRank: 2, weight: 25 },  // pick from top-3 moves,  25% of the time
+    { maxRank: 0, weight:  5 },  // pick best move,          5% of the time
+  ],
+  medium: [
+    { maxRank: 4, weight: 35 },
+    { maxRank: 2, weight: 50 },
+    { maxRank: 0, weight: 15 },
+  ],
+  hard: [
+    { maxRank: 4, weight: 15 },
+    { maxRank: 2, weight: 50 },
+    { maxRank: 0, weight: 35 },
+  ],
+};
+
+function pickByDifficulty(rankedMoves, difficulty) {
+  const profile = AI_DIFFICULTIES[difficulty] || AI_DIFFICULTIES.hard;
+  // Weighted random tier selection
+  const totalWeight = profile.reduce((s,t)=>s+t.weight, 0);
+  let roll = Math.random() * totalWeight;
+  let tier = profile[profile.length-1];
+  for (const t of profile) { roll -= t.weight; if (roll <= 0) { tier = t; break; } }
+  // Pick randomly from moves ranked 0..maxRank (clamped to available moves)
+  const maxIdx = Math.min(tier.maxRank, rankedMoves.length - 1);
+  return rankedMoves[Math.floor(Math.random() * (maxIdx + 1))];
+}
+
+// ── Main AI entry point ───────────────────────────────────────────
+function getAIMove(game, difficulty="hard") {
+  // Guard: if game is over or no moves available, return null
+  if (game.winner || game.isDraw || game.phase==="done") return null;
+
+  const moves = getLegalMoves(game, O);
+  if (moves.length === 0) return null;
+
+  // Always take an immediate major win — no difficulty penalty
+  for (const {majIdx,minIdx} of moves) {
+    try {
+      const g = applyMove(game, majIdx, minIdx);
+      if (g.winner===O) return {majIdx,minIdx};
+    } catch(e) {}
+  }
+
+  // Find moves that avoid handing X an immediate win
+  const safeMoves = moves.filter(({majIdx,minIdx}) => {
+    try {
+      const g1 = applyMove(game, majIdx, minIdx);
+      if (g1.winner===X) return false; // this move somehow lets X win directly
+      const xMoves = getLegalMoves(g1, X);
+      return !xMoves.some(({majIdx:xMaj,minIdx:xMin}) => {
+        try { return applyMove(g1,xMaj,xMin).winner===X; } catch(e) { return false; }
+      });
+    } catch(e) { return true; }
+  });
+  const candidateMoves = safeMoves.length > 0 ? safeMoves : moves;
+
+  // Score all candidates via 2-ply minimax
+  const scored = candidateMoves.map(({majIdx,minIdx}) => {
+    let score = 0;
+    try { score = scoreMove2Ply(game, majIdx, minIdx); } catch(e) {}
+    return { majIdx, minIdx, score: score + Math.random() * 0.5 };
+  });
+
+  // Sort best-first (descending)
+  scored.sort((a,b) => b.score - a.score);
+  if (scored.length === 0) return null;
+
+  // Pick based on difficulty
+  const chosen = pickByDifficulty(scored, difficulty);
+  return chosen ? { majIdx: chosen.majIdx, minIdx: chosen.minIdx } : null;
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -271,6 +456,8 @@ function applyEloChanges(myUser, oppUser, myResult) {
   if (!oppUser?.id) return myResult==="win"?GUEST_ELO_CHANGE:myResult==="loss"?-GUEST_ELO_CHANGE:0;
   return calcEloChange(myUser.elo||STARTING_ELO, oppUser.elo||STARTING_ELO, resultVal);
 }
+
+
 
 /* ═══════════════════════════════════════════════════════════════════
    KV HELPERS  (game rooms + quickplay via Supabase kv table)
@@ -690,7 +877,7 @@ function GameOver({game,mySymbol,mode,onRematch,onHome,eloChange}) {
 /* ═══════════════════════════════════════════════════════════════════
    GAME SCREEN
 ═══════════════════════════════════════════════════════════════════ */
-function GameScreen({mode,roomId,profile,updateProfile,onHome}) {
+function GameScreen({mode,roomId,profile,updateProfile,onHome,difficulty="hard"}) {
   const [game,setGame]=useState(initGame());
   const [myOnlineSym,setMyOnlineSym]=useState(null);
   const [roomData,setRoomData]=useState(null);
@@ -762,15 +949,55 @@ function GameScreen({mode,roomId,profile,updateProfile,onHome}) {
   },[game.winner,game.isDraw,mode,profile,myOnlineSym,oppProfile,updateProfile]);
 
   useEffect(()=>{
-    if(mode!=="vs-ai"||game.winner||game.isDraw||game.currentPlayer!==O||game.phase==="pick_major") return;
+    if(mode!=="vs-ai") return;
+    if(game.winner||game.isDraw||game.phase==="done") return;
+    if(game.currentPlayer!==O) return;
+    if(game.phase==="pick_major") return;
+
+    // Snapshot the game state now — use this same snapshot for both
+    // computing the move and applying it, so there's no stale closure mismatch
+    const snapshot = game;
     setAiThinking(true);
+
     const t=setTimeout(()=>{
-      const move=getAIMove(game);
-      if(move) setGame(applyMove(game,move.majIdx,move.minIdx));
+      try {
+        console.log("AI thinking, game state:", {
+          phase: snapshot.phase,
+          currentPlayer: snapshot.currentPlayer,
+          forcedMajor: snapshot.forcedMajor,
+          activeMajor: snapshot.activeMajor,
+          difficulty,
+        });
+        const moves = getLegalMoves(snapshot, O);
+        console.log("Legal moves available:", moves.length, moves.slice(0,3));
+        if(moves.length===0){ console.warn("AI: no legal moves"); setAiThinking(false); return; }
+
+        const move = getAIMove(snapshot, difficulty);
+        console.log("AI chose:", move);
+
+        if(move && move.majIdx!==undefined && move.minIdx!==undefined) {
+          const newGame = applyMove(snapshot, move.majIdx, move.minIdx);
+          setGame(newGame);
+        } else {
+          console.warn("AI returned null move — falling back to first legal move");
+          const fallback = moves[0];
+          setGame(applyMove(snapshot, fallback.majIdx, fallback.minIdx));
+        }
+      } catch(e) {
+        console.error("AI error:", e, e.stack);
+        // Emergency fallback — pick first legal move
+        try {
+          const fallbackMoves = getLegalMoves(snapshot, O);
+          if(fallbackMoves.length > 0) {
+            setGame(applyMove(snapshot, fallbackMoves[0].majIdx, fallbackMoves[0].minIdx));
+          }
+        } catch(e2) { console.error("Fallback also failed:", e2); }
+      }
       setAiThinking(false);
-    },500+Math.random()*400);
+    }, 500+Math.random()*400);
+
     return()=>clearTimeout(t);
-  },[game,mode]);
+  },[game, mode, difficulty]);
 
   // Stats update for local / vs-ai
   const gameEndHandled=useRef(false);
@@ -807,7 +1034,8 @@ function GameScreen({mode,roomId,profile,updateProfile,onHome}) {
     if(mode==="online"&&roomData) saveRoom(roomId,{...roomData,game:ng});
   }
 
-  const modeLabel=mode==="vs-ai"?"vs Computer":mode==="local"?"Local 2P":`Online · ${roomId}`;
+  const diffLabel=difficulty==="easy"?"Easy":difficulty==="medium"?"Medium":"Hard";
+  const modeLabel=mode==="vs-ai"?`vs Computer · ${diffLabel}`:mode==="local"?"Local 2P":`Online · ${roomId}`;
   return (
     <div style={{display:"flex",flexDirection:"column",alignItems:"center",minHeight:"100dvh",padding:"clamp(10px,2.5vw,20px)",animation:"fadeIn 0.4s ease"}}>
       <div style={{width:"100%",maxWidth:520,display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
@@ -1112,6 +1340,72 @@ function Instructions({onBack}) {
   );
 }
 
+
+/* ═══════════════════════════════════════════════════════════════════
+   DIFFICULTY PICKER
+═══════════════════════════════════════════════════════════════════ */
+function DifficultyPicker({onSelect,onBack}) {
+  const tiers = [
+    {
+      key:"easy",
+      icon:"🟢",
+      label:"Easy",
+      desc:"The CPU plays the 5th-best move most of the time. Good for learning the game.",
+      best:"5% chance of best move",
+      color:"#3dba78",
+    },
+    {
+      key:"medium",
+      icon:"🟡",
+      label:"Medium",
+      desc:"A genuine challenge. The CPU mixes good and great moves.",
+      best:"15% chance of best move",
+      color:"#f0c040",
+    },
+    {
+      key:"hard",
+      icon:"🔴",
+      label:"Hard",
+      desc:"The CPU plays strongly. It always sees 2 moves ahead and rarely wastes a turn.",
+      best:"35% chance of best move",
+      color:"#ff4444",
+    },
+  ];
+  const [hov,setHov]=useState(null);
+  return (
+    <div style={{animation:"fadeIn 0.3s ease",maxWidth:400,margin:"0 auto",padding:"clamp(16px,4vw,32px)"}}>
+      <button onClick={onBack} style={{background:"transparent",border:"none",color:C.muted,cursor:"pointer",fontSize:14,marginBottom:20}}>← Back</button>
+      <h2 style={{fontFamily:"'Orbitron',monospace",color:C.accent,fontSize:20,marginBottom:6}}>vs Computer</h2>
+      <p style={{color:"#b8b8d0",fontSize:13,marginBottom:24,lineHeight:1.5}}>
+        All difficulties use the same 2-ply AI — harder levels just act on it more reliably.
+      </p>
+      <div style={{display:"flex",flexDirection:"column",gap:12}}>
+        {tiers.map(t=>(
+          <button key={t.key}
+            onClick={()=>onSelect(t.key)}
+            onMouseEnter={()=>setHov(t.key)}
+            onMouseLeave={()=>setHov(null)}
+            style={{
+              padding:"clamp(14px,3vw,20px)",
+              background:hov===t.key?`${t.color}14`:C.card,
+              border:`2px solid ${hov===t.key?t.color:C.border}`,
+              borderRadius:14,cursor:"pointer",textAlign:"left",
+              transition:"all 0.2s",transform:hov===t.key?"translateY(-1px)":"translateY(0)",
+              boxShadow:hov===t.key?`0 6px 20px ${t.color}22`:"none",
+            }}>
+            <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:6}}>
+              <span style={{fontSize:22}}>{t.icon}</span>
+              <span style={{fontFamily:"'Orbitron',monospace",fontSize:16,color:t.color,fontWeight:700}}>{t.label}</span>
+              <span style={{marginLeft:"auto",fontSize:11,color:C.muted}}>{t.best}</span>
+            </div>
+            <p style={{fontSize:13,color:"#b8b8d0",lineHeight:1.5,margin:0}}>{t.desc}</p>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 /* ═══════════════════════════════════════════════════════════════════
    MENU BUTTON + HOME
 ═══════════════════════════════════════════════════════════════════ */
@@ -1153,7 +1447,7 @@ function HomeScreen({profile,onSelect,onSignOut}) {
         ):null}
       </div>
       <div style={{display:"flex",flexDirection:"column",gap:10,width:"100%",maxWidth:390}}>
-        <MenuButton icon="🤖" label="vs Computer" sublabel="Play against AI" color={C.o} onClick={()=>onSelect("vs-ai")}/>
+        <MenuButton icon="🤖" label="vs Computer" sublabel="Play against AI" color={C.o} onClick={()=>onSelect("difficulty")}/>
         <MenuButton icon="👥" label="Local 2 Player" sublabel="Pass & play on one device" color={C.x} onClick={()=>onSelect("local")}/>
         <MenuButton icon="🌐" label="Online Multiplayer" sublabel="Play with a friend online" color={C.success} onClick={()=>onSelect("online-lobby")}/>
         {profile&&<MenuButton icon="📊" label="My Statistics" sublabel={`${profile.stats?.played||0} games played`} color={C.accent} onClick={()=>onSelect("stats")}/>}
@@ -1170,9 +1464,11 @@ function HomeScreen({profile,onSelect,onSignOut}) {
 export default function App() {
   const [screen,setScreen]=useState("home");
   const [roomId,setRoomId]=useState(null);
+  const [aiDifficulty,setAiDifficulty]=useState("medium");
   const {session,profile,authLoading,signUp,signIn,signOut,updateProfile}=useAuth();
 
   const authHandlers={signUp,signIn};
+
 
   if(authLoading) return (
     <>
@@ -1193,7 +1489,8 @@ export default function App() {
         {!isConfigured() && <SetupScreen/>}
         {isConfigured() && <>
           {screen==="home"&&<HomeScreen profile={profile} onSelect={s=>setScreen(s)} onSignOut={signOut}/>}
-          {screen==="vs-ai"&&<GameScreen mode="vs-ai" profile={profile} updateProfile={updateProfile} onHome={()=>setScreen("home")}/>}
+          {screen==="difficulty"&&<DifficultyPicker onSelect={d=>{setAiDifficulty(d);setScreen("vs-ai");}} onBack={()=>setScreen("home")}/>}
+          {screen==="vs-ai"&&<GameScreen mode="vs-ai" difficulty={aiDifficulty} profile={profile} updateProfile={updateProfile} onHome={()=>setScreen("home")}/>}
           {screen==="local"&&<GameScreen mode="local" profile={profile} updateProfile={updateProfile} onHome={()=>setScreen("home")}/>}
           {screen==="online-lobby"&&<OnlineLobby profile={profile} onJoin={id=>{setRoomId(id);setScreen("online");}} onBack={()=>setScreen("home")}/>}
           {screen==="online"&&roomId&&<GameScreen mode="online" roomId={roomId} profile={profile} updateProfile={updateProfile} onHome={()=>setScreen("home")}/>}

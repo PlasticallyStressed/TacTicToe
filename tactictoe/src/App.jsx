@@ -1466,6 +1466,21 @@ function StatsScreen({profile,onBack}) {
 /* ═══════════════════════════════════════════════════════════════════
    AUTH SCREEN
 ═══════════════════════════════════════════════════════════════════ */
+
+// Stable Turnstile wrapper — isolated so its callbacks never cause remounts
+function StableTurnstile({ onVerify, onError }) {
+  // Use refs for callbacks so the widget never re-renders when parent state changes
+  const onVerifyRef = useRef(onVerify);
+  const onErrorRef  = useRef(onError);
+  useEffect(() => { onVerifyRef.current = onVerify; }, [onVerify]);
+  useEffect(() => { onErrorRef.current  = onError;  }, [onError]);
+
+  const stableVerify = useCallback((token) => onVerifyRef.current(token), []);
+  const stableError  = useCallback(() => onErrorRef.current(), []);
+
+  return <TurnstileWidget onVerify={stableVerify} onError={stableError} />;
+}
+
 function AuthScreen({onAuth,onBack,onSuccess}) {
   const [tab,setTab]=useState("login");
   const [username,setUsername]=useState("");
@@ -1477,12 +1492,20 @@ function AuthScreen({onAuth,onBack,onSuccess}) {
   const {signUp,signIn}=onAuth;
   useTurnstileScript();
 
+  // Stable callbacks for Turnstile — won't cause re-render of the widget
+  const handleVerify = useCallback((token) => {
+    setCaptchaToken(token);
+    setCaptchaError(false);
+  }, []);
+  const handleCaptchaError = useCallback(() => {
+    setCaptchaError(true);
+  }, []);
+
   async function handleSubmit(){
     if(!username.trim()||!password.trim()){setMsg("Fill in all fields.");return;}
     if(username.length<3){setMsg("Username must be 3+ characters.");return;}
     if(password.length<6){setMsg("Password must be 6+ characters.");return;}
     if(!/^[a-zA-Z0-9_]+$/.test(username)){setMsg("Username: letters, numbers, underscores only.");return;}
-    // CAPTCHA check on registration only
     if(tab==="register" && turnstileEnabled() && !captchaToken){
       setMsg("Please complete the security check.");return;
     }
@@ -1491,38 +1514,57 @@ function AuthScreen({onAuth,onBack,onSuccess}) {
       ? await signUp(username.trim(), password)
       : await signIn(username.trim(), password);
     if(result?.error){setMsg(result.error);setLoading(false);return;}
+    // Both register and login: go straight to home
     setLoading(false);
     onSuccess();
   }
 
   const inputStyle={width:"100%",padding:"12px 14px",background:C.surface,border:`1px solid ${C.border}`,borderRadius:10,color:C.text,fontSize:15,outline:"none",marginBottom:12};
+  const isRegister = tab==="register";
+  const captchaRequired = isRegister && turnstileEnabled();
+  const submitDisabled = loading || (captchaRequired && !captchaToken);
+
   return (
     <div style={{animation:"fadeIn 0.3s ease",maxWidth:360,margin:"0 auto",padding:"clamp(16px,4vw,32px)"}}>
       <button onClick={onBack} style={{background:"transparent",border:"none",color:C.muted,cursor:"pointer",fontSize:14,marginBottom:20}}>← Back</button>
       <h2 style={{fontFamily:"'Orbitron',monospace",color:C.accent,fontSize:20,marginBottom:24}}>Account</h2>
       <div style={{display:"flex",borderRadius:10,overflow:"hidden",border:`1px solid ${C.border}`,marginBottom:24}}>
         {["login","register"].map(t=>(
-          <button key={t} onClick={()=>{setTab(t);setMsg("");setCaptchaToken(null);}} style={{flex:1,padding:"10px 0",background:tab===t?C.accent:"transparent",color:tab===t?C.bg:C.muted,border:"none",fontWeight:700,fontSize:14,cursor:"pointer"}}>{t==="login"?"Sign In":"Register"}</button>
+          <button key={t} onClick={()=>{setTab(t);setMsg("");setCaptchaToken(null);setCaptchaError(false);}}
+            style={{flex:1,padding:"10px 0",background:tab===t?C.accent:"transparent",color:tab===t?C.bg:C.muted,border:"none",fontWeight:700,fontSize:14,cursor:"pointer"}}>
+            {t==="login"?"Sign In":"Register"}
+          </button>
         ))}
       </div>
       <input value={username} onChange={e=>setUsername(e.target.value)} placeholder="Username" style={inputStyle} autoCapitalize="none" autoCorrect="off" autoComplete="username"/>
-      <input value={password} onChange={e=>setPassword(e.target.value)} placeholder="Password" type="password" style={inputStyle} autoComplete={tab==="register"?"new-password":"current-password"}/>
-      {tab==="register" && turnstileEnabled() && (
+      <input value={password} onChange={e=>setPassword(e.target.value)} placeholder="Password" type="password" style={inputStyle} autoComplete={isRegister?"new-password":"current-password"}/>
+
+      {/* Turnstile — only shown on Register tab, stable so it never re-renders */}
+      {captchaRequired && (
         <div style={{marginBottom:12}}>
-          <TurnstileWidget
-            onVerify={token=>{setCaptchaToken(token);setCaptchaError(false);}}
-            onError={()=>{setCaptchaError(true);setMsg("Security check failed. Please try again.");}}
-          />
-          {captchaToken&&<p style={{fontSize:11,color:C.success,textAlign:"center",marginTop:6}}>✓ Verified</p>}
-          {captchaError&&<p style={{fontSize:11,color:C.err,textAlign:"center",marginTop:6}}>Security check failed — refresh and try again.</p>}
+          <StableTurnstile onVerify={handleVerify} onError={handleCaptchaError}/>
+          {captchaToken && !captchaError && (
+            <p style={{fontSize:11,color:C.success,textAlign:"center",marginTop:6}}>✓ Verified</p>
+          )}
+          {captchaError && (
+            <p style={{fontSize:11,color:C.err,textAlign:"center",marginTop:6}}>Security check failed — refresh and try again.</p>
+          )}
         </div>
       )}
+
       {msg&&<p style={{color:C.err,fontSize:13,marginBottom:12}}>{msg}</p>}
-      <button onClick={handleSubmit} disabled={loading||(tab==="register"&&turnstileEnabled()&&!captchaToken)} style={{width:"100%",padding:"13px 0",background:`linear-gradient(135deg,${C.accent},${C.accentDim})`,color:C.bg,border:"none",borderRadius:10,fontWeight:700,fontSize:16,cursor:"pointer",opacity:(loading||(tab==="register"&&turnstileEnabled()&&!captchaToken))?0.5:1}}>
-        {loading?"…":tab==="login"?"Sign In":"Create Account"}
+
+      <button onClick={handleSubmit} disabled={submitDisabled} style={{
+        width:"100%",padding:"13px 0",
+        background:`linear-gradient(135deg,${C.accent},${C.accentDim})`,
+        color:C.bg,border:"none",borderRadius:10,fontWeight:700,fontSize:16,
+        cursor:submitDisabled?"default":"pointer",
+        opacity:submitDisabled?0.5:1,
+      }}>
+        {loading?"…":isRegister?"Create Account":"Sign In"}
       </button>
       <p style={{color:"#b8b8d0",fontSize:13,marginTop:16,textAlign:"center",lineHeight:1.5}}>
-        {tab==="login"?"No account? Switch to Register above.":"Passwords are handled securely by Supabase — never stored in plain text."}
+        {isRegister?"Passwords are handled securely by Supabase — never stored in plain text.":"No account? Switch to Register above."}
       </p>
     </div>
   );
